@@ -47,4 +47,4 @@ all_species <- all_species %>% rowwise() %>% mutate(Atlantis.group=match_name(Sc
 
 # need to finish the rest manually (also to check that everything is sensible)
 
-#write.csv(all_species,"data/dfo_species.csv",row.names=FALSE)
+write.csv(all_species,"data/dfo_species.csv",row.names=FALSE)

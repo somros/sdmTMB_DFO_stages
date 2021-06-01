@@ -17,7 +17,7 @@ library(lubridate)
 select <- dplyr::select
 
 # Settings for sdmTMB.
-knots <- 100
+knots <- 300
 
 # #Workflow:
 #   
@@ -65,6 +65,8 @@ get_effort <- function(survey_area){
   return(effort)
 }
 effort_all <- rbindlist(lapply(all_surveys,FUN = get_effort)) # 4533 sets as of May 2021
+# how many sets are deeper than 1000 m?
+# nrow(effort_all %>% filter(Bottom.depth..m. > 1000))/nrow(effort_all)*100 # less than 1%
 
 
 #This chunk will be looped for each Atlantis group. 
@@ -115,7 +117,7 @@ dfo_knitter <- function(this_group) {
   
   # here it needs to call the sdmTMB document
   rmarkdown::render(
-    'DFO_sdmTMB.Rmd', output_file = paste0("outputs/knitted_outputs/", this_group, "_", knots, '.html')
+    'DFO_sdmTMB.Rmd', output_file = paste0("outputs/knitted_outputs_no_time/", this_group, "_", knots, '.html')
   )
 }
 

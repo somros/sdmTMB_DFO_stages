@@ -17,7 +17,18 @@ library(lubridate)
 select <- dplyr::select
 
 # Settings for sdmTMB.
-knots <- 300
+cutoff <- 20
+
+# read in BGM for projection
+atlantis_bgm <- read_bgm("data/GOA_WGS84_V4_final.bgm")
+
+# prediciton grid, make the depth positive for consistency with RACE data. Also append coordinates, and add time dimension
+load("data/atlantis_grid_depth.Rdata")
+atlantis_coords <- atlantis_grid_depth %>% st_as_sf(coords = c("x", "y"), crs = atlantis_bgm$extra$projection) %>%
+  st_transform(crs = "+proj=longlat +datum=WGS84") %>% dplyr::select(geometry)
+
+atlantis_grid_template <- cbind(atlantis_grid_depth, do.call(rbind, st_geometry(atlantis_coords)) %>%
+                                  as_tibble() %>% setNames(c("lon","lat")))
 
 # #Workflow:
 #   
@@ -34,6 +45,10 @@ knots <- 300
 
 path_to_surveys <- paste(getwd(),"data/surveys",sep = "/")
 all_surveys <- dir(path_to_surveys)
+
+# drop WCHG
+all_surveys <- setdiff(all_surveys, "WCHG")
+
 get_catch <- function(survey_area){
   sa <- survey_area
   sa_path <- paste(path_to_surveys,sa,sep="/")
@@ -102,7 +117,7 @@ dfo_knitter <- function(this_group) {
   species_all_hauls <- species_all_hauls %>% filter(!is.na(Bottom.depth..m.))
   
   # drop some columns and rename as for the RACE bottom trawl surveys
-  species_all_hauls <- species_all_hauls %>% select(Survey.Year, hauljoin, Start.latitude, Start.longitude, Bottom.depth..m.,Atlantis.group,Name,cpue_kgkm2,cpue_numkm2,Survey.area) %>%
+  species_all_hauls <- species_all_hauls %>% select(Survey.Year, hauljoin, End.latitude, End.longitude, Bottom.depth..m.,Atlantis.group,Name,cpue_kgkm2,cpue_numkm2,Survey.area) %>%
     set_names(c(
       "year",
       "hauljoin",
@@ -117,11 +132,9 @@ dfo_knitter <- function(this_group) {
   
   # here it needs to call the sdmTMB document
   rmarkdown::render(
-    'DFO_sdmTMB.Rmd', output_file = paste0("outputs/knitted_outputs_no_time/", this_group, "_", knots, '.html')
+    'DFO_sdmTMB_template.Rmd', output_file = paste0("outputs/knitted_output_afterSean/", this_group, "_", cutoff, '.html')
   )
 }
-
-#lapply(ag,FUN=dfo_knitter)
 
 purrr::map(ag, possibly(dfo_knitter, NA))
 

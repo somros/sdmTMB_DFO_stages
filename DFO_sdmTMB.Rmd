@@ -106,7 +106,7 @@ m_depth <- sdmTMB(
   reml = TRUE,
   anisotropy = FALSE,
   spatial_trend = FALSE, 
-  spatial_only = FALSE,
+  spatial_only = TRUE,
   silent = FALSE,
   control = sdmTMBcontrol(),
   nlminb_loops = 3,

@@ -1,0 +1,291 @@
+---
+title: "Catch to CPUE DFO"
+author: "Alberto Rovellini"
+date: "11/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This document puts the Synoptic Bottom Trawl Survey data for groundfish into the same format that we use for RACE data, with the aim of using the same sdmTMB workflow on these. It is based on the data as downloaded from [here](https://open.canada.ca/data/en/dataset/a278d1af-d567-4964-a109-ae1e84cbd24a). 
+
+This document takes DFO bottom trawl catch data, size-composition information, size at 50% maturity, and length-weight relationships to:
+
+1. Calculate CPUE at haul level based on catch and haul information. 
+2. Based on size-composition data and length at 50% maturity, label each fish in the size-composition subsample as juvenile or adult.
+3. Based on length-weight relationships, calculate the weight of each fish in the size-composition subsample.
+4. Add up the weights of the juveniles and the weights of the adults in the size-composition subsample, and obtain the proportion of the catch made up by each stage.
+5. Use those proportions to break down the total catch in the haul into catch of juveniles and catch of adults, and turn to CPUE.
+6. Check that it maps to the total CPUE from point 1.
+
+**IMPORTANT**: this approach assumes that the subsample taken for the size-composition is representative of size composition of the entire haul.
+```{r, include=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(sf)
+library(raster)
+library(viridis)
+library(maps)
+library(mapdata)
+library(FishLife)
+library(data.table)
+```
+
+```{r}
+select <- dplyr::select
+```
+
+# Read data
+
+Read in Atlantis groups, the DFO species list, and map them to one another.
+```{r}
+atlantis_key <- read.csv("dfo_species_atlantis_Nov162021.csv")
+atlantis_key <- atlantis_key %>% filter(Atlantis.group != "?")
+atlantis_groups <- read.csv("GOA_Groups.csv", fileEncoding = "UTF-8-BOM")
+atlantis_groups <- atlantis_groups %>% select(Code,Name,LongName)
+#join into one key with long names
+atlantis_key <- atlantis_key %>% left_join(atlantis_groups, by = c("Atlantis.group"="Code"))
+```
+
+Read in catch from bottom trawl surveys.
+```{r}
+path_to_surveys <- "C:/Users/Alberto Rovellini/Documents/GOA/SDM/Canada_stages/catch_to_CPUE_DFO/surveys"
+all_surveys <- dir(path_to_surveys)
+
+# drop WCHG
+all_surveys <- setdiff(all_surveys, "WCHG")
+
+get_catch <- function(survey_area){
+  sa <- survey_area
+  sa_path <- paste(path_to_surveys,sa,sep="/")
+  catch <- read.csv(paste(sa_path,paste(sa,"catch.csv",sep="_"),sep="/"))
+  catch$Survey.area <- sa
+  return(catch)
+}
+catch_all <- rbindlist(lapply(all_surveys,FUN = get_catch))
+
+catch_all <- catch_all %>% mutate(Haul.Join.ID = paste(Trip.identifier,Set.number,sep = '_'))
+
+# it seems quite common that this data includes NA catches. Sometimes the catch in weight is NA and there are counts, sometimes both empty (is that presence/absence?). Drop all empty catches in weight
+catch_all <- catch_all %>% filter(!is.na(Catch.weight..kg.))
+```
+
+Read in biology data the same way, as that contains the length information.
+```{r}
+get_biology <- function(survey_area){
+  sa <- survey_area
+  sa_path <- paste(path_to_surveys,sa,sep="/")
+  biology <- read.csv(paste(sa_path,paste(sa,"biology.csv",sep="_"),sep="/"))
+  biology$Survey.area <- sa
+  return(biology)
+}
+biology_all <- rbindlist(lapply(all_surveys,FUN = get_biology))
+
+biology_all <- biology_all %>% mutate(Haul.Join.ID = paste(Trip.identifier,Tow.number,sep = '_')) # for some reason called tow instead of set here - double check that they are the same thing
+```
+
+Read in effort data for the hauls, same procedure.
+```{r}
+get_effort <- function(survey_area){
+  sa <- survey_area
+  sa_path <- paste(path_to_surveys,sa,sep="/")
+  effort <- read.csv(paste(sa_path,paste(sa,"effort.csv",sep="_"),sep="/"))
+  effort$Survey.area <- sa
+  return(effort)
+}
+effort_all <- rbindlist(lapply(all_surveys,FUN = get_effort)) # 3651 sets as of May 2021
+
+effort_all <- effort_all %>% mutate(Haul.Join.ID = paste(Trip.identifier,Set.number,sep = '_'))
+
+#save(effort_all, file = "hauls_dfo.Rdata")
+```
+
+# Size composition
+
+How many of the hauls in the catch have size composition information of some kind? Match the hauls in the two datasets
+```{r}
+h1 <- biology_all %>% select(Haul.Join.ID) %>% distinct() %>% pull()
+h2 <- catch_all %>% select(Haul.Join.ID) %>% distinct() %>% pull()
+common_hauls <- intersect(h1,h2)
+length(common_hauls)/length(h2) # 0.9931507 of catch hauls
+length(common_hauls)/length(h1) # 1 length hauls
+```
+Almost all hauls in the catch data have some size composition information.
+
+First of, what species do we have in the size comp set?
+```{r}
+species <- biology_all %>% 
+  group_by(English.common.name,Scientific.name,Sex) %>% # Sex of the fish: 0 = not examined; 1 = male; 2 = female, 3 = unknown
+  tally() %>% 
+  ungroup() %>%
+  arrange(desc(n)) #%>%
+  # mutate(prop=n/sum(n)*100) %>%
+  # filter(prop>1)
+```
+
+Here we need:
+
+1. Length at 50% maturity for each species to assign the correct stage to each row.
+2. A length-weight relationship for each species. Ideally these will be given to us by the RACEBASE people. For now, to limit the time commitment, use estimates from meta-analytical approaches like Froese et al. (2014).
+
+## Length at maturity
+
+For the purpose of splitting between juveniles and adults, we use estimates of length at maturity from the `FishLife` [package](https://github.com/James-Thorson-NOAA/FishLife). This is approximate and ideally we will swap out with Alaska-specific values for the groundfish.
+```{r}
+source('funs_lw_lmat.R')
+
+sizecomp_species <- species %>% select(Scientific.name) %>% distinct() %>%
+  mutate(tt = strsplit(Scientific.name, ' ')) %>%
+  rowwise() %>%
+  mutate(Genus = tt[1],
+         Species = tt[2]) %>%
+  select(Genus, Species) %>%
+  drop_na() %>%
+  ungroup()
+
+# add pollock, it still goes by its old name in Fishbase for some reason
+sizecomp_species <- rbind(sizecomp_species, c('Theragra','chalcogramma'))
+
+fl_params <- (FishLife::FishBase_and_RAM$beta_gv) # all species params
+fl_names <- row.names(fl_params)
+fl_covmat <- (FishLife::FishBase_and_RAM$Cov_gvv) # all species variance covariance
+
+lmat_key <- sizecomp_species %>% 
+  mutate(lmat = purrr::pmap(list(this_genus=Genus,this_species=Species),get_lmat)) %>%
+  unnest(cols = c(lmat), keep_empty = T)
+```
+About 50 species do not get filled with this method. Some of them are because the scientific names do not correspond.
+
+## Length-weight relationships
+
+Taking parameters from [Froese et al. (2014)](https://doi.org/10.1111/jai.12299). The form of the LW relationship in the Bayesian hierarchical analysis is $W=a*L^b$. I apply their code in `SingleSpeciesLWR_7.R` to obtain mean estimates of log10a and b from Bayesian hierarchical analysis based on (1) priors that are specific to body shape of the fish, and (2) previous studies that act as data to get a posterior distribution of the parameters. Importantly, for these parameters, weight is in grams and length is in centimeters.
+```{r}
+lw_key <- sizecomp_species %>% 
+  mutate(lw_bayes = purrr::pmap(list(this_genus=Genus,this_species=Species),apply_Froese)) %>%
+  unnest_wider(col = c(lw_bayes)) %>%
+  set_names(c('Genus','Species','Log10a','b')) %>%
+  mutate(a=10^Log10a) %>%
+  select(-Log10a)
+```
+
+Join length-weight and length at maturity keys.
+```{r}
+lw_lmat <- lw_key %>% 
+  left_join(lmat_key, by = c('Genus','Species')) %>%
+  drop_na() %>%
+  mutate(Scientific.name = paste(Genus, Species, sep = ' ')) %>%
+  select(-Genus,-Species)
+
+# restore pollock to the correct name
+lw_lmat$Scientific.name <- toupper(gsub('Theragra chalcogramma','Gadus chalcogrammus',lw_lmat$Scientific.name))
+```
+
+60 species have LW and length at maturity information with this method. That is, for a lot of species we cannot do this. In those instances, assume that the catch is 'adults'. 
+```{r}
+sizecomp_with_params <- biology_all %>% left_join(lw_lmat, by = 'Scientific.name')
+
+# clean length
+sizecomp_with_params <- sizecomp_with_params %>%
+  rowwise() %>%
+  mutate(Length..mm.=ifelse(!is.na(Fork.length..mm.),Fork.length..mm.,
+                            ifelse(!is.na(Total.length..mm.),Total.length..mm.,Standard.length..mm.))) %>%
+  filter(!is.na(Length..mm.))
+
+# apply length-weight relationship
+weight_prop_by_stage <- sizecomp_with_params %>% 
+  mutate(Weight.g=a*(Length..mm./10)^b) %>%
+  rowwise() %>%
+  mutate(Stage=ifelse(is.na(lmat),'U',ifelse(Length..mm./10>lmat,'A','J'))) %>% # undetermined 
+  ungroup() %>%
+  group_by(Haul.Join.ID,English.common.name,Scientific.name,Stage) %>%
+  summarise(Weight.stage.g=sum(Weight.g, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(Haul.Join.ID,English.common.name,Scientific.name) %>%
+  mutate(Prop.Weight=ifelse(Stage=='U',1,Weight.stage.g/sum(Weight.stage.g))) %>%
+  select(-Weight.stage.g)
+
+# change undetermined to adult
+weight_prop_by_stage$Stage <- gsub('U','A',weight_prop_by_stage$Stage)
+```
+
+Now join the information of the proportion by haul back with the catch data. It becomes apparent here that a lot of hauls do not have size comp information for all species that were caught in the haul. Options:
+
+1. Drop all that is not in the size comp database. This is not going to work, this way we lose a lot of data.
+2. Assume that all that is not sized is an adult. Not ideal, but that was the starting point anyway.
+
+Do 2 for now. 
+```{r}
+catch_with_props <- catch_all %>% 
+  filter(Haul.Join.ID %in% common_hauls) %>% # subset to the hauls that exist in both the sizecomp and catch data sets
+  full_join(weight_prop_by_stage, by = c('Haul.Join.ID','Scientific.name','English.common.name')) %>%
+  rowwise() %>%
+  mutate(Stage = ifelse(is.na(Stage),'A',Stage),
+         Prop.Weight = ifelse(is.na(Prop.Weight),1,Prop.Weight))
+```
+
+Now apportion the catch in weight based on the proportion. 
+```{r}
+catch_with_props <- catch_with_props %>%
+  mutate(Weight..kg.stage = Catch.weight..kg.*Prop.Weight)
+```
+
+Check: does the catch calculated this way add up with the catch in the raw DFO data?
+```{r}
+check_stage <- catch_with_props %>% group_by(Haul.Join.ID,Species.code) %>% summarise(catch=sum(Weight..kg.stage))
+check_original <- catch_all %>% filter(Haul.Join.ID %in% common_hauls) %>% group_by(Haul.Join.ID,Species.code) %>% summarise(catch=sum(Catch.weight..kg.))
+
+check_both <- check_original %>% left_join(check_stage, by=c('Haul.Join.ID','Species.code')) %>% mutate(diff=catch.x-catch.y)
+```
+Looking good.
+
+# Match to Atlantis groups and get CPUE
+
+This is going to yield the input for sdmTMB, as CPUE.R data. Then all we need is a brief knitter document that reads in the geometry and the depth grid.
+```{r}
+#join catch data with Atlantis key by scientific name, which seems to be unique to each record in the DFO data
+catch_with_props_atlantis <- catch_with_props %>% left_join(atlantis_key %>% select(Scientific.name,Atlantis.group,Name), by = "Scientific.name")
+
+# drop the NA in the groups - it means it is one of the undecided
+catch_with_props_atlantis <- catch_with_props_atlantis %>% filter(!is.na(Atlantis.group))
+
+# sum catch across species in the same Atlantis group
+catch_with_props_atlantis <- catch_with_props_atlantis %>% 
+  group_by(Survey.area,Survey.Year,Haul.Join.ID,Atlantis.group,Name,Stage) %>% 
+  summarise(Weight..kg.stage = sum(Weight..kg.stage)) %>%
+  ungroup()
+
+catch_all_hauls <- catch_with_props_atlantis %>% left_join(effort_all, by = c('Survey.area','Survey.Year','Haul.Join.ID')) # Joining, by = c('Survey.area','Survey.Year','Haul.Join.ID')
+
+# calculate area swept in km2, and CPUE for weight and numbers as biom/aream/1000
+catch_all_hauls <- catch_all_hauls %>% mutate(area_sweptkm2 = Distance.towed..m.*Trawl.door.spread..m./1e+6,
+                                                  cpue_kgkm2 = Weight..kg.stage/area_sweptkm2)
+
+# extract month here - RACE data is 6,7,8, but these seem to start in May. Come back to this and try with overlapping months only
+# species_all_hauls <- species_all_hauls %>% mutate(month = month(ymd(Set.date))) %>% filter(month %in% 6:8)
+
+#assume that NA catches are 0, since they come from sets with no catch
+catch_all_hauls$cpue_kgkm2[which(is.na(catch_all_hauls$cpue_kgkm2))] <- 0
+
+#filter out NA depth
+catch_all_hauls <- catch_all_hauls %>% filter(!is.na(Bottom.depth..m.))
+
+# drop some columns and rename as for the RACE bottom trawl surveys
+catch_all_hauls <- catch_all_hauls %>% select(Survey.Year, Haul.Join.ID, End.latitude, End.longitude, Bottom.depth..m.,Atlantis.group, Name, Stage, cpue_kgkm2, Survey.area) %>%
+  set_names(c(
+    "year",
+    "hauljoin",
+    "lat",
+    "lon",
+    "depth",
+    "species_code",
+    "name",
+    "stage",
+    "biom_kgkm2", # that is CPUE
+    "survey"))
+```
+
+```{r}
+save(catch_all_hauls, file = "cpue_by_stage_DFO.Rdata")
+```

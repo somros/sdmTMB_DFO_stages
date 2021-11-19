@@ -40,19 +40,10 @@ Note: This data extends deeper than 1000 m. We may decide to discard the data po
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-# Read data
-```{r}
-dfo_data <- species_all_hauls
-```
-
 This is DFO data from [here](https://open.canada.ca/data/en/dataset/a278d1af-d567-4964-a109-ae1e84cbd24a). Note: for lat and lon, for now I am using the start values for each tow, but it would be easy to get the coordinates for the midpoint of the tow.
 
 Take a quick look at the data spatially.
 ```{r, fig.width = 12, fig.height = 12}
-# coast mask
-coast <- map("worldHires", regions = c("Canada", "USA"), plot = FALSE, fill = TRUE)
-coast_sf <- coast %>% st_as_sf() #%>% st_transform(crs = atlantis_bgm$extra$projection)
-
 ggplot()+
   geom_point(data = dfo_data, aes(lon, lat, colour = log1p(biom_kgkm2)), size = 1.5)+
   scale_colour_viridis_c()+
@@ -60,7 +51,7 @@ ggplot()+
   coord_sf(xlim = c(min(dfo_data$lon),max(dfo_data$lon)), ylim=c(min(dfo_data$lat),max(dfo_data$lat)))+
   theme_minimal()+
   facet_wrap(~year, ncol = 3)+
-  labs(title = paste(dfo_data$name,"CPUE from DFO bottom trawl survey"))#, dfo_data$stage, sep = " "))
+  labs(title = paste(dfo_data$name,"CPUE from DFO bottom trawl survey, stage:", dfo_data$stage, sep = " "))
 ```
 
 Take a quick look at time series of total CPUE from raw data
@@ -75,6 +66,30 @@ ggplot(biom_year, aes(year, log(biom)))+
 ```
 The above is across the entire GOA. 
 
+# Add zeroes for hauls with no catch
+
+We need to add empty hauls (i.e., hauls where the catch for a given species is 0). 
+```{r}
+data_hauls <- levels(factor(dfo_data$hauljoin))
+zero_hauls <- setdiff(levels(factor(effort_all$Haul.Join.ID)), data_hauls) # assuming that if there are no records from a haul, the catch in that haul was 0 for this species
+
+# make a data frame to bind by row
+zero_catches <- effort_all %>% filter(Haul.Join.ID %in% zero_hauls) %>% 
+  select(Survey.Year, Haul.Join.ID, End.latitude, End.longitude, Bottom.depth..m.) %>% 
+  mutate(species_code = rep(NA, length(Survey.Year)),
+         name = rep(NA, length(Survey.Year)),
+         stage = rep(NA, length(Survey.Year)),
+         biom_kgkm2 = rep(0, length(Survey.Year))) %>%
+  set_names(names(dfo_data))
+
+# attach by row to race_data
+dfo_data <- rbind(dfo_data, zero_catches)
+# ditch hauls with empty lat or lon
+dfo_data <- dfo_data %>% filter(!is.na(lat) | !is.na(lon))
+# and with NA depths
+dfo_data <- dfo_data %>% filter(!is.na(depth))
+```
+
 # sdmTMB
 
 ## Create spatial mesh
@@ -85,8 +100,6 @@ The first step here will be to go from the native lat lon coordinates of the bot
 
 Read in the Atlantis BGM, then turn the bottom trawl data to an sf object, reproject it, and then turn it back to coordinates.
 ```{r}
-#atlantis_bgm <- read_bgm("data/GOA_WGS84_V4_final.bgm")
-
 dfo_data_sf <- dfo_data %>% st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% st_transform(crs = atlantis_bgm$extra$projection)
 
 # now extract coordinates, and divide by 1000 to transform m to km
@@ -139,8 +152,6 @@ m_depth <- sdmTMB(
   spatial_only = FALSE,
   silent = FALSE,
   control = sdmTMBcontrol(),
-  # nlminb_loops = 3,
-  # newton_steps = 10,
   family = tweedie(link = "log"))
 end.time <- Sys.time()
 time.taken_m_depth <- end.time - start.time
@@ -149,7 +160,7 @@ time.taken_m_depth
 
 Rerun with extra optimization steps in case of gradient > 0.001. 
 ```{r, results = FALSE}
-if(max(m_depth$gradients)>0.001){
+if(abs(max(m_depth$gradients))>0.001){
   m_depth <- sdmTMB(
   data = dfo_data, 
   formula = biom_kgkm2 ~ 0 + s(depth, k = 5) + as.factor(year), 
@@ -160,9 +171,7 @@ if(max(m_depth$gradients)>0.001){
   spatial_trend = FALSE, 
   spatial_only = FALSE,
   silent = FALSE,
-  control = sdmTMBcontrol(),
-  nlminb_loops = 1,
-  newton_steps = 3,
+  control = sdmTMBcontrol(nlminb_loops = 1,newton_steps = 3),
   family = tweedie(link = "log"))
 end.time <- Sys.time()
 }
@@ -261,8 +270,8 @@ atlantis_grid <- atlantis_grid %>% mutate(x = x/1000, y = y/1000)
 
 Make SDM predictions onto new data from depth model. **Back-transforming here**
 ```{r}
-predictions_race <- predict(m_depth, newdata = atlantis_grid, return_tmb_object = TRUE)
-atlantis_grid$estimates <- exp(predictions_race$data$est) #Back-transforming here
+predictions_dfo <- predict(m_depth, newdata = atlantis_grid, return_tmb_object = TRUE)
+atlantis_grid$estimates <- exp(predictions_dfo$data$est) #Back-transforming here
 
 atlantis_grid_sf <- atlantis_grid %>% mutate(x=x*1000,y=y*1000) %>% st_as_sf(coords = c("x", "y"), crs = atlantis_bgm$extra$projection) # better for plots, multiplying the coordinates by 1000 for visualisation
 ```
@@ -318,7 +327,7 @@ ggplot()+
 
 Have a look at CPUE by depth. This is rough and quick, keep in mind that most tows happen shallower than 300 m, so the sample is not equal between depths. Also, DFO data often does not include abundance estimates (not the data product I could access anyway).
 ```{r}
-ggplot(data = dfo_data, aes(x = depth, y = log1p(biom_kgkm2), color = log1p(num_km2)))+
+ggplot(data = dfo_data, aes(x = depth, y = log1p(biom_kgkm2)))+
   scale_color_viridis()+
   geom_point()+
   theme_minimal()+
@@ -484,7 +493,7 @@ Write out a .csv.
 ```{r}
 out <- means_canada %>% st_set_geometry(NULL)
 
-write.csv(x = out, file = paste0("C:/Users/arove/Documents/GOA/SDM/Canada/outputs/knitted_output_afterSean/cpue_tables/",dfo_data$name[1],"_DFO.csv"), row.names = FALSE)
+write.csv(x = out, file = paste0("C:/Users/Alberto Rovellini/Documents/GOA/SDM/Canada_stages/outputs/cpue_tables/",dfo_data$name[1],dfo_data$stage[1],"_DFO.csv"), row.names = FALSE)
 ```
 
 # Validation metrics
@@ -492,13 +501,17 @@ write.csv(x = out, file = paste0("C:/Users/arove/Documents/GOA/SDM/Canada/output
 Let's produce a table that includes: convergence metrics; Pearson's correlation coefficient for predicted vs observed; RMSE; and normalised RMSE. 
 
 ```{r}
-data.frame(m_depth$model$convergence, # convergence
-           m_depth$model$message, # more convergence
-           max(m_depth$gradients), # max gradient
-           m_depth$tmb_obj$report()$range, # practical range
-           cor(dfo_corr$biom_kgkm2, dfo_corr$predictions, use = "everything", method = "pearson"), # correlation
-           sqrt(sum((dfo_corr$predictions - dfo_corr$biom_kgkm2)^2)/nrow(dfo_corr)),# RMSE
-           sqrt(sum((dfo_corr$predictions - dfo_corr$biom_kgkm2)^2)/nrow(dfo_corr))/(max(dfo_corr$biom_kgkm2)-min(dfo_corr$biom_kgkm2))*100 # NRMSE
-) %>% set_names(c("Convergence","Message","Max gradient","Practical range (km)","Pearson's correlation","RMSE","NRMSE(%)"))
+val <- data.frame(dfo_data$name[1], # group
+                  m_depth$model$convergence, # convergence
+                  m_depth$model$message, # more convergence
+                  max(m_depth$gradients), # max gradient
+                  m_depth$tmb_obj$report()$range, # practical range
+                  cor(dfo_corr$biom_kgkm2, dfo_corr$predictions, use = "everything", method = "pearson"), # correlation
+                  sqrt(sum((dfo_corr$predictions - dfo_corr$biom_kgkm2)^2)/nrow(dfo_corr)),# RMSE
+                  sqrt(sum((dfo_corr$predictions - dfo_corr$biom_kgkm2)^2)/nrow(dfo_corr))/(max(dfo_corr$biom_kgkm2)-min(dfo_corr$biom_kgkm2))*100 # NRMSE
+) %>% set_names(c("Group","Convergence","Message","Max gradient","Practical range (km)","Pearson's correlation","RMSE","NRMSE(%)"))
 
+val
+
+write.csv(x = val, file = paste0("C:/Users/Alberto Rovellini/Documents/GOA/SDM/Canada_stages/outputs/validation_tables/",dfo_data$name[1],dfo_data$stage[1],"_DFO.csv"), row.names = FALSE)
 ```

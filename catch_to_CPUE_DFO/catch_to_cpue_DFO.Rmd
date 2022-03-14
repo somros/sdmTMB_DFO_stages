@@ -55,7 +55,7 @@ path_to_surveys <- "C:/Users/Alberto Rovellini/Documents/GOA/SDM/Canada_stages/c
 all_surveys <- dir(path_to_surveys)
 
 # drop WCHG
-all_surveys <- setdiff(all_surveys, "WCHG")
+# all_surveys <- setdiff(all_surveys, "WCHG")
 
 get_catch <- function(survey_area){
   sa <- survey_area
@@ -99,7 +99,7 @@ effort_all <- rbindlist(lapply(all_surveys,FUN = get_effort)) # 3651 sets as of 
 
 effort_all <- effort_all %>% mutate(Haul.Join.ID = paste(Trip.identifier,Set.number,sep = '_'))
 
-#save(effort_all, file = "hauls_dfo.Rdata")
+save(effort_all, file = "hauls_dfo_2.Rdata")
 ```
 
 # Size composition
@@ -287,5 +287,5 @@ catch_all_hauls <- catch_all_hauls %>% select(Survey.Year, Haul.Join.ID, End.lat
 ```
 
 ```{r}
-save(catch_all_hauls, file = "cpue_by_stage_DFO.Rdata")
+save(catch_all_hauls, file = "cpue_by_stage_DFO_2.Rdata")
 ```

@@ -24,7 +24,7 @@ coast <- map("worldHires", regions = c("Canada", "USA"), plot = FALSE, fill = TR
 coast_sf <- coast %>% st_as_sf() 
 
 # haul info
-load('catch_to_CPUE_DFO/hauls_dfo.Rdata') # as accessible on AKFIN Answers with no further modifications
+load('catch_to_CPUE_DFO/hauls_dfo_2.Rdata') 
 
 # atlantis bgm
 atlantis_bgm <- read_bgm("data/GOA_WGS84_V4_final.bgm")
@@ -45,11 +45,12 @@ load("catch_to_cpue_DFO/cpue_by_stage_DFO.Rdata")
 all_groups <- catch_all_hauls %>% select(species_code, stage) %>% distinct()
 
 cpue_knitter <- function(this_group,this_stage){
+  
   dfo_data <- catch_all_hauls %>% filter(species_code == this_group & stage==this_stage) %>% select(-survey)
   
   rmarkdown::render(
     'DFO_sdmTMB_template.Rmd', 
-    output_file = paste0("outputs/", this_group, this_stage, "_", cutoff, '.html')
+    output_file = paste0("output/", this_group, this_stage, "_", cutoff, '.html')
   )
 }
 

@@ -10,6 +10,7 @@ Visualise how the DFO species are mapped to the Atlantis groups. Attribution of 
 ```{r}
 library(tidyverse)
 library(kableExtra)
+library(data.table)
 ```
 
 ```{r}
@@ -60,4 +61,65 @@ kbl(species_table, col.names = c("Atlantis group code", "Atlantis group name", "
   column_spec(4, width = "30em")
 ```
 
+# Read in data
+
+Read in catch from bottom trawl surveys. Remember that we are dropping WCHG from here (and I am not too convinced yet that this is a good idea).
+```{r}
+path_to_surveys <- "C:/Users/Alberto Rovellini/Documents/GOA/SDM/Canada_stages/catch_to_CPUE_DFO/surveys"
+all_surveys <- dir(path_to_surveys)
+
+# drop WCHG
+all_surveys <- setdiff(all_surveys, "WCHG")
+
+get_catch <- function(survey_area){
+  sa <- survey_area
+  sa_path <- paste(path_to_surveys,sa,sep="/")
+  catch <- read.csv(paste(sa_path,paste(sa,"catch.csv",sep="_"),sep="/"))
+  catch$Survey.area <- sa
+  return(catch)
+}
+catch_all <- rbindlist(lapply(all_surveys,FUN = get_catch))
+
+catch_all <- catch_all %>% mutate(Haul.Join.ID = paste(Trip.identifier,Set.number,sep = '_'))
+
+# it seems quite common that this data includes NA catches. Sometimes the catch in weight is NA and there are counts, sometimes both empty (is that presence/absence?). Drop all empty catches in weight
+catch_all <- catch_all %>% filter(!is.na(Catch.weight..kg.))
+```
+
+Add Atlantis group, subset to RFS, see the catch comp of all species for that group.
+```{r}
+comp <- catch_all %>% 
+  left_join((dfo_species %>% select(Scientific.name,Name)), by = 'Scientific.name') %>%
+  group_by(Survey.Year,Name,Scientific.name) %>%
+  summarize(Catch = sum(Catch.weight..kg., na.rm=T)) %>%
+  group_by(Survey.Year,Name) %>%
+  mutate(Catch.AG=sum(Catch),
+         Prop = Catch/Catch.AG) %>%
+  ungroup() %>%
+  filter(Name=='Rockfish_slope') %>%
+  arrange(Survey.Year,desc(Prop))
+
+comp %>% ggplot()+
+  geom_bar(aes(x = Survey.Year, y = Prop, fill = Scientific.name), stat = "identity", position = "stack")+
+  theme_minimal()
+```
+
+For all times.
+Add Atlantis group, subset to RFS, see the catch comp of all species for that group.
+```{r}
+catch_all %>% 
+  left_join((dfo_species %>% select(Scientific.name,Name)), by = 'Scientific.name') %>%
+  group_by(Name,Scientific.name) %>%
+  summarize(Catch = sum(Catch.weight..kg., na.rm=T)) %>%
+  group_by(Name) %>%
+  mutate(Catch.AG=sum(Catch),
+         Prop = Catch/Catch.AG) %>%
+  ungroup() %>%
+  filter(Name=='Rockfish_slope') %>%
+  arrange(desc(Prop))
+
+comp %>% ggplot()+
+  geom_bar(aes(x = Name, y = Prop, fill = Scientific.name), stat = "identity", position = "stack")+
+  theme_minimal()
+```
 

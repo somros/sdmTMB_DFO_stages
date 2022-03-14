@@ -1,7 +1,7 @@
 ---
 title: "Atlantis biomass distributions with sdmTMB - lat, lon, depth"
 author: "Alberto Rovellini"
-date: "6/21/2021"
+date: "3/14/2022"
 output:
   html_document:
     code_folding: hide
@@ -11,28 +11,17 @@ output:
 
 # Purpose
 
-**This document is based on Gemma's code.**
+This is a template for fitting `sdmTMB` to GOA bottom trawl data. For each stage of species, we fit an `sdmTMB` model to AKFIN CPUE data (manually calculated from catch and effort information, see `catch_to_cpue_DFO.Rmd`) to predict CPUE in kg per km$^{2}$ onto a regular grid. This predicted CPUE is then scaled up to box area in Atlantis, to get biomass per box and proportion of the total by box, which is what we need to initialize Atlantis. This same code will be run for biomass pool species too, except for those we will not split into juveniles and adults.
 
-**Update 6/16/2021 after talking to Sean Anderson**
-
-Sean recommended a few changes, so we will play around with thise here:
-1. Do everything in projected coordinates instead of degrees.
-2. Play around with cutoff argument to make the mesh, instead of number of knots.
-3. Add max gradient for the checks of convergence. Read what this is about intuitively. 
-4. Turn the model code to its default, with no extra optimization. Might put in a if statement, where if the gradient is too high we re-run it with some of those extra optimization routines to help convergence.
-5. Optional: If we are bothered by 0 CPUE, we could bin data and predictions. I am inclined to skip this, best to show that the model does not get zeroes right, which seems normal for this type of models.
-6. Optional: Have a look at the branch where Sean implemented the calculation of SD of the predictions (optional for now, I feel like we have enough sensible checks in place).
-
-**Update 6/20/2021**
-Because getting access to RACEBASE data and age-structured information, we have chosen to start from using the same distribution for juveniles and adults.
-
-This is a template for fitting sdmTMB to GOA bottom trawl data. For each species, it fits sdmTMB to life stages (juveniles or adults) to predict CPUE in kg per km$^{2}$. This predicted CPUE is then scaled up to box area in Atlantis, to get biomass per box and proportion of the total by box, which is what we need to initialise Atlantis. This same code will be run for biomass pool species too, except for those we will not split inot juveniles and adults.
+Catch of juveniles and adults for each species is calculated in `catch_to_cpue_DFO.Rmd` based on length composition data from the bottom trawl, length at maturity, and a length-weight relationship. 
 
 This workflow is based on the following assumptions:
 
-1. We use lat, lon and depth as predictors. We do not use environmental covariates as predictors because we are not attempting to explain why fish species are distributed the way they are, but rather we are trying to have sensible generic distributions over the model domain throughout the study period (1984-2019).
-2. We predict over a regular grid. The size of this grid is 10 km at the moment for computational efficiency, but this is arbitrary and we may need to test different grid sizes and see how the results change. After some testing with predicting over a grid of 1 point per Atlantis box, I chose to use a regular grid because: (1) an average value of lat and lon, such as a centroid, is difficult to calculate for some of the boxes with crescent shapes; and (2) some boxes are placed over areas where depth changes greatly (the GOA bathymetry is complex), and the inside points may fall inside or near a deeper/shallower area withih a certain box. While the Atlantis box itself has a constant depth, the nearest node of the SPDE mesh may have been near such deeper/shallower area, thus skewing the estimate of the biomass index for that particular box.
+1. We use lat and lon (converted from degrees to km) and depth as predictors. We do not use environmental covariates as predictors because we are not attempting to explain why species are distributed the way they are, but rather we are trying to have sensible generic distributions over the model domain throughout the study period (2003-2019).
+2. We predict over a regular 10 km grid. After some testing with predicting over a grid of 1 point per Atlantis box, I chose to use a regular grid because: (1) an average value of lat and lon, such as a centroid, is difficult to calculate for some of the boxes with crescent shapes; and (2) some boxes are placed over areas where depth changes greatly (the GOA bathymetry is complex), and the inside points may fall inside or near a deeper/shallower area withih a certain box. While the Atlantis box itself has a constant depth, the nearest node of the SPDE mesh may have been near such deeper/shallower area, thus skewing the estimate of the biomass index for that particular box.
 3. We are not so interested in accurate predictions for any one year, but rather in representative means of where the fish has been over the last few decades. This code runs a temporal model and takes averages of the estimates at the end.
+
+This workflow does not include Alaska. 
 
 Note: This data extends deeper than 1000 m. We may decide to discard the data points deeper than 1000 m for consistency with the RACE-GAP data, or we may just keep them all for the sake of sample size. Sets deeper than 1000 m are <1% of the sets, so probably hardly any difference either way.
 
@@ -40,7 +29,8 @@ Note: This data extends deeper than 1000 m. We may decide to discard the data po
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-This is DFO data from [here](https://open.canada.ca/data/en/dataset/a278d1af-d567-4964-a109-ae1e84cbd24a). Note: for lat and lon, for now I am using the start values for each tow, but it would be easy to get the coordinates for the midpoint of the tow.
+This is DFO data from [here](https://open.canada.ca/data/en/dataset/a278d1af-d567-4964-a109-ae1e84cbd24a). 
+Note: we use ending latitude and longitude values for each tow.
 
 Take a quick look at the data spatially.
 ```{r, fig.width = 12, fig.height = 12}
@@ -55,7 +45,7 @@ ggplot()+
 ```
 
 Take a quick look at time series of total CPUE from raw data
-```{r}
+```{r, fig.align="center"}
 biom_year <- dfo_data %>% group_by(year) %>% summarise(biom = sum(log1p(biom_kgkm2)))
 
 ggplot(biom_year, aes(year, log(biom)))+
@@ -64,7 +54,7 @@ ggplot(biom_year, aes(year, log(biom)))+
   theme_minimal()+
   labs(title = paste(dfo_data$name,"total GOA CPUE from bottom \n trawl survey - stage:", dfo_data$stage, sep = " "))
 ```
-The above is across the entire GOA. 
+The above is for the whole area. 
 
 # Add zeroes for hauls with no catch
 
@@ -109,13 +99,30 @@ dfo_coords <- dfo_data_sf %>% st_coordinates() %>% data.frame() %>% mutate(x=X/1
 dfo_data <- dfo_data_sf %>% st_set_geometry(NULL) %>% data.frame(dfo_coords)
 ```
 
+Adding an `sf` object of the coastline to incorporate in the mesh.
+```{r}
+data_bbox <- dfo_data_sf %>% st_bbox()
+coast_mesh <- coast_sf %>% st_transform(crs=atlantis_bgm$extra$projection) %>%
+  st_crop(data_bbox)
+```
+
 Using the "cutoff" argument, instead of predefining the number of points. This will help with AFSC vs DFO (use the same distance), also it does not depend on the random seed or on the order of the data.
 
 **Note:** SPDE = Stochastic Partial Differential Equations approach. Some material can be found [here](https://becarioprecario.bitbucket.io/spde-gitbook/ch-intro.html#sec:spde), but basically it is a way of calculating the position of the mesh knots. 
 
+We take land barriers into account when building the mesh (see `sdmTMB` documentation).
 ```{r}
-dfo_spde <- make_mesh(dfo_data, c("x", "y"), cutoff = cutoff, type = "cutoff")
-plot(dfo_spde)
+dfo_spde <- make_mesh(dfo_data, c("x", "y"), cutoff = 20, type = "cutoff")
+
+# add barrier
+dfo_spde <- add_barrier_mesh(
+  spde_obj = dfo_spde,
+  barrier_sf = coast_mesh,
+  range_fraction = 0.1,
+  proj_scaling = 1000, # data km but projection m
+  plot = TRUE
+)
+
 dfo_spde$mesh$n
 ```
 
@@ -135,24 +142,24 @@ length(which(dfo_data$biom_kgkm2 == 0))/nrow(dfo_data)*100
 
 ## Space, time, and depth model.
 
-Try running a model with smooth term for depth. Using 5 knots for the smooth - but this is arbitrary and a range of values could be tested. As a note, I am not scaling depth here. The reason is that depth has a different range in the data and the prediction grid, and thus scaled values have different meaning between the two.
+Fitting a model with a smooth term for depth. Using 3 knots for the smooth, after testing k=5 (k=3 seems to return more sensible predictions at depth for several species). As a note, I am not scaling depth here. The reason is that depth has a different range in the data and the prediction grid, and thus scaled values have different meaning between the two.
 
-**Model type**: the distribution of the response variable plotted above should give a sense of what model is most appropriate. CPUE data for many of these species resemble a Tweedie distribution when log-transformed, so we use a Tweedie model with a log link. Some groups may warrant a different model, and this will be evaluated case-by-case depending on convergence issues, distribution of model residuals, and model skill metrics (see below).
-
+**Model type**: We use a Tweedie model with a log link, as a relatively widely adopted option for similar survey data. 
 ```{r, results = FALSE}
 start.time <- Sys.time()
+
 m_depth <- sdmTMB(
-  data = dfo_data, 
-  formula = biom_kgkm2 ~ 0 + s(depth, k = 5) + as.factor(year), 
-  time = "year", 
-  spde = dfo_spde, 
-  reml = TRUE,
-  anisotropy = FALSE,
-  spatial_trend = FALSE, 
-  spatial_only = FALSE,
-  silent = FALSE,
-  control = sdmTMBcontrol(),
-  family = tweedie(link = "log"))
+    data = dfo_data, 
+    formula = biom_kgkm2 ~ 0 + s(depth, k = 3) + as.factor(year), 
+    mesh = dfo_spde, 
+    time = "year", 
+    spatial = 'on',
+    spatiotemporal = 'iid', # spatiotemporal random fields independent and identically distributed
+    reml = TRUE,
+    anisotropy = FALSE,
+    silent = FALSE,
+    family = tweedie(link = "log"))
+
 end.time <- Sys.time()
 time.taken_m_depth <- end.time - start.time
 time.taken_m_depth
@@ -161,34 +168,34 @@ time.taken_m_depth
 Rerun with extra optimization steps in case of gradient > 0.001. 
 ```{r, results = FALSE}
 if(abs(max(m_depth$gradients))>0.001){
+  
   m_depth <- sdmTMB(
-  data = dfo_data, 
-  formula = biom_kgkm2 ~ 0 + s(depth, k = 5) + as.factor(year), 
-  time = "year", 
-  spde = dfo_spde, 
-  reml = TRUE,
-  anisotropy = FALSE,
-  spatial_trend = FALSE, 
-  spatial_only = FALSE,
-  silent = FALSE,
-  control = sdmTMBcontrol(nlminb_loops = 1,newton_steps = 3),
-  family = tweedie(link = "log"))
-end.time <- Sys.time()
+    data = dfo_data, 
+    formula = biom_kgkm2 ~ 0 + s(depth, k = 3) + as.factor(year), 
+    mesh = dfo_spde, 
+    time = "year", 
+    spatial = 'on',
+    spatiotemporal = 'iid', # spatiotemporal random fields independent and identically distributed
+    reml = TRUE,
+    anisotropy = FALSE,
+    silent = FALSE,
+    control = sdmTMBcontrol(nlminb_loops = 2, newton_loops = 3),
+    family = tweedie(link = "log"))
+  
 }
 ```
 
 Check information on model convergence. From [the nlminb help page](https://rdrr.io/r/stats/nlminb.html) we know that an integer 0 indicates succesful convergence. Additional information on convergence can be checked with m_depth\$model\$message. According to the original [PORT optimization documentation](https://web.archive.org/web/20070203144320/http://netlib.bell-labs.com/cm/cs/cstr/153.pdf), "Desirable return codes are 3, 4, 5, and sometimes 6".  
 ```{r}
 if(m_depth$model$convergence == 0){print("The model converged.")} else {print("Check convergence issue.")}
-m_depth$model$message
-max(m_depth$gradients)
-m_depth$tmb_obj$report()$range
+m_depth$model$message # convergence message
+max(m_depth$gradients) # maximum gradient component 
+tidy(m_depth, effects = 'ran_pars') %>% filter(term=='range') %>% pull(estimate) # Matérn range
 ```
-The range is a parameter that indicates the distance at which autocorrelation in the data drops to about 0.13. A large range means that spatial autocorrelation decays more slowly with distance. A smaller range will require more knots. The range can be obtained from the model object, but it always seems to be larger than the cutoff argunemt we choose to create the INLA mesh. I guess let's make sure that the range is always larger than the cutoff.
 
-Interestingly, increasing the number of knots in the mesh does not necessarily seem to decrease the gradient. 
+The Matérn range is a parameter that indicates the distance at which data points become essentially independent. A large range means that spatial autocorrelation decays more slowly with distance. A smaller range will require more knots. A range larger than the cutoff argument should be sensible.
 
-Check out model residuals. 
+Check out model residuals. Note that this is a rough check, the package authors recommend to use DHARMA residuals (see approach [here](https://pbs-assess.github.io/sdmTMB/articles/residual-checking.html)).
 ```{r}
 dfo_data$resids <- residuals(m_depth) # randomized quantile residuals
 hist(dfo_data$resids)
@@ -202,12 +209,12 @@ abline(a = 0, b = 1)
 
 Plot the response curve from the depth smooth term.
 ```{r}
-plot(m_depth$mgcv_mod, rug = TRUE)
+plot_smooth(m_depth, ggplot = T)
 ```
 
 Finally, plot the residuals in space. If residuals are constantly larger/smaller in some of the areas, it may be sign that the model is biased and it over/underpredicts consistently for some areas. Residuals should be randomly distributed in space. 
 
-For visualisation purposes, multiply the coordinates by 1000 in the sf object to restore the correct scale.
+For visualization purposes, multiply the coordinates by 1000 in the sf object to restore the correct scale.
 ```{r, fig.width = 12, fig.height=12}
 dfo_sf <- dfo_data %>% mutate(x = x*1000, y = y*1000) %>% st_as_sf(coords = c(x = "x", y = "y"), crs = atlantis_bgm$extra$projection) #%>% st_transform(crs = atlantis_bgm$extra$projection) # turn to spatial object
 
@@ -228,9 +235,9 @@ ggplot()+
 Take a grid (which must contain information on the predictors we used to build the model) and predict the biomass index over such grid based on the predictors. 
 
 1. The grid is currently a regular grid with 10-km cell size, but 10 km might not be enough to get prediction points in all boxes - especially for a couple very small and narrow boxes at the western end of the model domain. Revisit this if necessary, but a finer mesh could be difficult to justify compared to the density of the survey data. 
-2. The grid covers the entire Atlantis model domain, including the non-dynamic boundary boxes (deeper than 1000 m). The grid at the moment also includes Canada boxes, although predictions for these boxes will not be considered here.
+2. The grid covers the entire Atlantis model domain, including the non-dynamic boundary boxes (deeper than 1000 m). Predictions for Alaska boxes will not be used here.
 
-Read in the Atlantis prediction grid (10 km) modified in Atlantis_grid_covars.R (code not included here).
+Read in the Atlantis prediction grid (10 km) modified in `Atlantis_grid_covars.R` (code not included here).
 ```{r}
 atlantis_boxes <- atlantis_bgm %>% box_sf()
 ```
@@ -248,7 +255,7 @@ atlantis_grid <- atlantis_grid[rep(1:nrow(atlantis_grid), length(all_years)),]
 atlantis_grid$year <- as.integer(rep(all_years, each = nrow(atlantis_grid_depth)))
 ```
 
-Visualise the prediction grid.
+Visualize the prediction grid.
 ```{r}
 coast_tmp <- map("worldHires", regions = c("Canada", "USA"), plot = FALSE, fill = TRUE)
 coast_tmp <- coast_tmp %>% st_as_sf() %>% st_transform(crs = atlantis_bgm$extra$projection)
@@ -299,7 +306,7 @@ atlantis_grid_means <- atlantis_grid %>% group_by(year, box_id) %>%
 predictions_by_box <- atlantis_boxes %>% inner_join(atlantis_grid_means, by = "box_id")
 ```
 
-See estimates per box for all years. Silence boundary boxes as they throw the scale out of whack (and they do not need predictions). 
+See estimates per box for all years. Silence boundary boxes as they they do not need predictions. 
 ```{r, fig.width = 12, fig.height = 12}
 predictions_by_box <- predictions_by_box %>% rowwise() %>% mutate(mean_estimates = ifelse(isTRUE(boundary), NA, mean_estimates))
 
@@ -325,10 +332,9 @@ ggplot()+
   labs(title = paste(dfo_data$name,"CPUE from DFO bottom trawl survey - stage:", dfo_data$stage, sep = " "))
 ```
 
-Have a look at CPUE by depth. This is rough and quick, keep in mind that most tows happen shallower than 300 m, so the sample is not equal between depths. Also, DFO data often does not include abundance estimates (not the data product I could access anyway).
+Have a look at CPUE by depth. This is rough and quick, keep in mind that most tows happen shallower than 300 m, so the sample is not equal between depths.
 ```{r}
 ggplot(data = dfo_data, aes(x = depth, y = log1p(biom_kgkm2)))+
-  scale_color_viridis()+
   geom_point()+
   theme_minimal()+
   labs(title = "CPUE by depth")
@@ -430,9 +436,8 @@ ggplot(dfo_corr, aes(x = log1p(biom_kgkm2), y = log1p(predictions)))+ # log for 
 ```
 
 These models often underpredict zeroes, i.e. they predict a catch where there was none. Does this happen randomly in space? Does it have a correlation of some kind with depth?
-There may be an argument for dropping WCHG from the data.
 
-Plot zero catch from the data and the relative predictions. Turn to sf for plotting.
+Plot zero catch from the data and the relative predictions. Turn to `sf` for plotting.
 ```{r, fig.width = 12, fig.height = 12}
 dfo_corr %>% filter(biom_kgkm2 == 0) %>%
   mutate(x=x*1000,y=y*1000) %>%
@@ -446,7 +451,6 @@ dfo_corr %>% filter(biom_kgkm2 == 0) %>%
   labs(title = "Model predictions at zero-catch locations")+
   facet_wrap(~year, ncol = 3)
 ```
-For adult ATF with 450 knots and k = 5 in the depth spline, it seems that non-zero CPUE is predicted by the model at locations of zero catch all over the GOA. However, the magnitude of the CPUE values does not seem completely random in space. Smaller CPUE values are predicted in some years for zero-catch on the slope (i.e., at depth). Some of the higher values are predicted East of Kodiak. 
 
 What about the relationship between model residuals and depth?
 ```{r, fig.width = 12, fig.height=16}
@@ -458,7 +462,6 @@ dfo_data %>%
   theme_minimal()+
   facet_wrap(~year, ncol = 2)
 ```
-There does not seem to be an obvious relationship between depth and residuals. 
 
 ## Root Mean Square Error (RMSE)
 
@@ -467,7 +470,7 @@ Calculate RMSE between predicted and observed values.
 paste("RMSE:", sqrt(sum((dfo_corr$predictions - dfo_corr$biom_kgkm2)^2)/nrow(dfo_corr)), " kg km-2", sep = " ") ### traditional rmse metric, in units kg km2
 ```
 
-Normalised RMSE. 
+Normalized RMSE. 
 ```{r}
 rmse_cv <- sqrt(sum((dfo_corr$predictions - dfo_corr$biom_kgkm2)^2)/nrow(dfo_corr))/(max(dfo_corr$biom_kgkm2)-min(dfo_corr$biom_kgkm2))*100 #### normalised rmse, expressed as a % of the range of observed biomass values, sort of approximates a coefficient of variation 
 paste("Normalised RMSE:", paste0(rmse_cv, "%"), sep = " ")
@@ -476,8 +479,6 @@ paste("Normalised RMSE:", paste0(rmse_cv, "%"), sep = " ")
 # Total biomass and biomass per box
 
 The current estimated CPUE is in kg km$^{-2}$. So, just we just turn that into biomass per box. Remember that the area is in m$^2$ for the boxes, so need to divide by 1,000,000.
-
-Do this separate for Alaska and Canada, since we are using different data. Total biomass to calculate only for the respective regions, as well as box biomass. Proportional biomass (S1-S4), instead, makes sense only for the entire model domain, so that will be in another script.
 ```{r}
 means_all_years <- means_all_years %>% mutate(biomass = all_years_kgkm2*area*1e-06*1e-03) # from kg to t
 
@@ -493,19 +494,21 @@ Write out a .csv.
 ```{r}
 out <- means_canada %>% st_set_geometry(NULL)
 
-write.csv(x = out, file = paste0("C:/Users/Alberto Rovellini/Documents/GOA/SDM/Canada_stages/outputs/cpue_tables/",dfo_data$name[1],dfo_data$stage[1],"_DFO.csv"), row.names = FALSE)
+write.csv(x = out, 
+          file = paste0("C:/Users/Alberto Rovellini/Documents/GOA/SDM/sdmTMB_Canada_stages/output/cpue_tables/",dfo_data$name[1],dfo_data$stage[1],"_DFO.csv"), 
+          row.names = FALSE)
 ```
 
 # Validation metrics
 
-Let's produce a table that includes: convergence metrics; Pearson's correlation coefficient for predicted vs observed; RMSE; and normalised RMSE. 
+Let's produce a table that includes: convergence metrics; Pearson's correlation coefficient for predicted vs observed; RMSE; and normalized RMSE. 
 
 ```{r}
 val <- data.frame(dfo_data$name[1], # group
                   m_depth$model$convergence, # convergence
                   m_depth$model$message, # more convergence
                   max(m_depth$gradients), # max gradient
-                  m_depth$tmb_obj$report()$range, # practical range
+                  tidy(m_depth, effects = 'ran_pars') %>% filter(term=='range') %>% pull(estimate), # matern range
                   cor(dfo_corr$biom_kgkm2, dfo_corr$predictions, use = "everything", method = "pearson"), # correlation
                   sqrt(sum((dfo_corr$predictions - dfo_corr$biom_kgkm2)^2)/nrow(dfo_corr)),# RMSE
                   sqrt(sum((dfo_corr$predictions - dfo_corr$biom_kgkm2)^2)/nrow(dfo_corr))/(max(dfo_corr$biom_kgkm2)-min(dfo_corr$biom_kgkm2))*100 # NRMSE
@@ -513,5 +516,7 @@ val <- data.frame(dfo_data$name[1], # group
 
 val
 
-write.csv(x = val, file = paste0("C:/Users/Alberto Rovellini/Documents/GOA/SDM/Canada_stages/outputs/validation_tables/",dfo_data$name[1],dfo_data$stage[1],"_DFO.csv"), row.names = FALSE)
+write.csv(x = val, 
+          file = paste0("C:/Users/Alberto Rovellini/Documents/GOA/SDM/sdmTMB_Canada_stages/output/validation_tables/",dfo_data$name[1],dfo_data$stage[1],"_DFO.csv"), 
+          row.names = FALSE)
 ```
